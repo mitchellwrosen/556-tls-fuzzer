@@ -28,6 +28,7 @@ main = do
 main' :: String -> IO ()
 main' host = do
     certStore <- getSystemCertificateStore
+
     withContext host weakRng certStore allCiphersuites $ \context -> do
         contextHookSetLogging context (def { loggingPacketSent = putStrLn
                                            , loggingPacketRecv = putStrLn
