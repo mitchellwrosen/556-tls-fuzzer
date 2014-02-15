@@ -2,4 +2,10 @@ results.out
 dist/
 .cabal-sandbox/
 cabal.sandbox.config
-res/
+inputs/
+results/
+*.out
+*.ps
+*.prof
+*.hp
+*.aux

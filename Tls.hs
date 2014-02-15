@@ -6,15 +6,14 @@ module Tls
     , withContext
     ) where
 
-import Control.Exception
-import Crypto.Random
-import Data.Default
-import Data.X509.CertificateStore (CertificateStore)
-import Network.Simple.TCP
-import Network.TLS
-import Network.TLS.Extra.Cipher
-
-import qualified Data.ByteString as BS
+import           Control.Exception          (bracket, bracketOnError)
+import           Crypto.Random              (CPRG, SystemRNG, cprgCreate, createTestEntropyPool)
+import qualified Data.ByteString            as BS
+import           Data.Default               (def)
+import           Data.X509.CertificateStore (CertificateStore)
+import           Network.Simple.TCP         (HostName, ServiceName, SockAddr, Socket, closeSock, connectSock)
+import           Network.TLS                (Cipher, ClientParams(..), Context, Shared(..), Supported(..), contextClose, contextNew)
+import           Network.TLS.Extra.Cipher
 
 allCiphersuites :: [Cipher]
 allCiphersuites =
@@ -45,10 +44,15 @@ withContext :: CPRG a
             -> [Cipher]
             -> (Context -> IO b)
             -> IO b
-withContext host rng certStore ciphers = bracket (makeContext host rng certStore ciphers) contextClose
+withContext host rng certStore ciphers =
+    bracket
+        (makeContext host rng certStore ciphers)
+        contextClose
 
-withTcpSocket :: HostName -> ServiceName -> ((Socket, SockAddr) -> IO a) -> IO a
-withTcpSocket host port = bracketOnError (connectSock host port) (closeSock . fst)
+-- | Like Network.Simple.TCP.connect, but keep the socket alive after the
+-- provided action.
+withPersistentTcp :: HostName -> ServiceName -> ((Socket, SockAddr) -> IO a) -> IO a
+withPersistentTcp host port = bracketOnError (connectSock host port) (closeSock . fst)
 
 makeContext :: CPRG a
             => HostName
@@ -56,15 +60,16 @@ makeContext :: CPRG a
             -> CertificateStore
             -> [Cipher]
             -> IO Context
-makeContext host rng certStore ciphers = withTcpSocket host "443" $ \(sock, _) -> do
-    let params = ClientParams {
-          clientUseMaxFragmentLength    = Nothing
-        , clientServerIdentification    = (host, BS.empty)
-        , clientUseServerNameIndication = True -- TODO ?
-        , clientWantSessionResume       = Nothing
-        , clientShared                  = def { sharedCAStore = certStore }
-        , clientHooks                   = def
-        , clientSupported               = def { supportedCiphers = ciphers }
-        }
+makeContext host rng certStore ciphers = do
+    withPersistentTcp host "443" $ \(sock, _) -> do
+        let params = ClientParams {
+              clientUseMaxFragmentLength    = Nothing
+            , clientServerIdentification    = (host, BS.empty)
+            , clientUseServerNameIndication = True -- TODO ?
+            , clientWantSessionResume       = Nothing
+            , clientShared                  = def { sharedCAStore = certStore }
+            , clientHooks                   = def
+            , clientSupported               = def { supportedCiphers = ciphers }
+            }
 
-    contextNew sock params rng
+        contextNew sock params rng

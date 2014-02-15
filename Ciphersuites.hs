@@ -3,85 +3,119 @@
 module Main where
 
 import Control.Applicative
-import Control.Concurrent         (ThreadId, killThread, threadDelay)
-import Control.Concurrent.Suspend (Delay, sDelay)
-import Control.Concurrent.Timer   (oneShotTimer)
-import Control.Monad
+import Control.Concurrent.ParallelIO.Local
 import Control.Exception
-import Crypto.Random
 import Data.IORef
-import Data.X509.CertificateStore (CertificateStore)
+import Data.X509.CertificateStore          (CertificateStore)
 import Network.Simple.TCP
 import Network.TLS
 import Network.TLS.Struct
-import System.Environment         (getArgs)
+import Options.Applicative
 import System.IO
-import System.X509                (getSystemCertificateStore)
+import qualified System.Timeout as T
+import System.X509                         (getSystemCertificateStore)
 
-import qualified Data.ByteString as BS
-
-import ThreadManager
 import Tls
 import Utils
 
-main :: IO ()
-main = do
-    args <- getArgs
-    case args of
-        [hostfile,numhosts] -> main' hostfile (read numhosts)
-        _ -> hPutStrLn stderr "Usage: ./a.out hostfile numhosts"
+data Cli = Cli
+    { cliNumThreads :: Int
+    , cliDelay      :: Int
+    , cliFrom       :: Maybe Int
+    , cliTo         :: Maybe Int
+    , cliHostfile   :: String
+    }
 
-main' :: String -> Int -> IO ()
-main' hostfile numhosts = do
+cli :: Parser Cli
+cli = Cli <$> numThreads <*> timeout <*> from <*> to <*> hostfile
+  where
+    numThreads :: Parser Int
+    numThreads = option $
+        short 'n' <>
+        long "num-threads" <>
+        help "The maximum number of threads to use." <>
+        value 10 <>
+        metavar "NUM-THREADS"
+
+    timeout :: Parser Int
+    timeout = option $
+        short 't' <>
+        long "timeout" <>
+        help "The timeout (in seconds) before closing a connection." <>
+        value 5 <>
+        metavar "TIMEOUT"
+
+    from :: Parser (Maybe Int)
+    from = optional $ option $
+        long "from" <>
+        help "From host" <>
+        metavar "FROM"
+
+    to :: Parser (Maybe Int)
+    to = optional $ option $
+        long "to" <>
+        help "To host" <>
+        metavar "TO"
+
+    hostfile :: Parser String
+    hostfile = argument str $
+        help "The file of hosts to connect to, one per line" <>
+        metavar "HOSTS"
+
+main :: IO ()
+main = execParser opts >>= main'
+  where
+    opts = info (helper <*> cli) $
+        fullDesc <>
+        progDesc "Determine the ciphersuites accepted by HTTPS servers." <>
+        header "Ciphersuite scraper"
+
+main' :: Cli -> IO ()
+main' (Cli numThreads timeout mfrom mto hostfile) = do
     hSetBuffering stderr NoBuffering
 
-    threadManager <- newManager
-    hosts         <- take numhosts . lines <$> readFile hostfile
-    certStore     <- getSystemCertificateStore
+    let from = maybe 0 id mfrom
 
-    forM_ hosts (doWork threadManager certStore)
-    waitAll threadManager >>= putStrLn . formatOutput
+    hosts     <- maybe id (\to -> take (to-from)) mto . drop from . lines <$> readFile hostfile
+    certStore <- getSystemCertificateStore
+
+    parallelWithPoolOf numThreads (map (getCiphersuites timeout certStore) hosts)
+        >>= putStrLn . formatOutput
   where
-    doWork :: ThreadManager (HostName,[CipherID]) -> CertificateStore -> HostName -> IO ThreadId
-    doWork threadManager certStore host = do
-        {-threadDelay 1000000-}
-        tid <- fork threadManager $ getCiphersuites certStore host
-        _ <- oneShotTimer (killThread tid) (sDelay 5)
-        return tid
-
-    formatOutput :: [FinishedThreadStatus (HostName,[CipherID])] -> String
+    formatOutput :: [(HostName,[CipherID])] -> String
     formatOutput = unlines . map formatOutput'
       where
-        formatOutput' :: FinishedThreadStatus (HostName,[CipherID]) -> String
-        formatOutput' (Left ex) = "FAILED: " ++ show ex
-        formatOutput' (Right (host, cs)) = host ++ " " ++ show cs
+        formatOutput' :: (HostName,[CipherID]) -> String
+        formatOutput' (host, cs) = host ++ " " ++ show cs
 
-getCiphersuites :: CertificateStore -> HostName -> IO (HostName,[CipherID])
-getCiphersuites certStore host = do
+parallelWithPoolOf :: Int -> [IO a] -> IO [a]
+parallelWithPoolOf n as = withPool n (\pool -> parallel pool as)
+
+getCiphersuites :: Int -> CertificateStore -> HostName -> IO (HostName,[CipherID])
+getCiphersuites timeout certStore host = do
     hPutStr stderr "."
     ciphersRef   <- newIORef allCiphersuites
     cipherIdsRef <- newIORef []
-    loop certStore ciphersRef cipherIdsRef host
+    loop ciphersRef cipherIdsRef
   where
-    loop :: CertificateStore -> IORef [Cipher] -> IORef [CipherID] -> HostName -> IO (HostName,[CipherID])
-    loop certStore ciphersRef cipherIdsRef host = do
+    loop :: IORef [Cipher] -> IORef [CipherID] -> IO (HostName,[CipherID])
+    loop ciphersRef cipherIdsRef = do
         ciphers <- readIORef ciphersRef
         -- Have we tried all ciphers?
         if not (null ciphers)
             then catch
                 (do
-                    withContext host weakRng certStore ciphers $ \context -> do
-                        contextHookSetHandshakeRecv context handshakeRecvHook
-                        handshake context
-                    loop certStore ciphersRef cipherIdsRef host)
-                onError
+                    {-result <- T.timeout (timeout*1000000) $-}
+                        withContext host weakRng certStore ciphers $ \context -> do
+                            contextHookSetHandshakeRecv context handshakeRecvHook
+                            handshake context
+                        loop ciphersRef cipherIdsRef)
+                    {-case result of-}
+                        {-Nothing -> return (host,[]) -- timed out-}
+                        {-Just _  -> loop ciphersRef cipherIdsRef)-}
+                (\(_ :: SomeException) -> makeReturnValue)
             else makeReturnValue
       where
-        -- We expect a TLSException if the server doesn't like any proposed ciphersuites.
-        -- However, we propogate other exceptions (such as ThreadKilled)
-        onError :: SomeException -> IO (HostName,[CipherID])
-        onError e = maybe (throw e) (\_ -> makeReturnValue) (fromException e :: Maybe TLSException)
-
         makeReturnValue :: IO (HostName,[CipherID])
         makeReturnValue = (host,) <$> readIORef cipherIdsRef
 
