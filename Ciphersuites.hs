@@ -16,7 +16,6 @@ import qualified System.Timeout as T
 import System.X509                         (getSystemCertificateStore)
 
 import Tls
-import Utils
 
 data Cli = Cli
     { cliNumThreads :: Int
@@ -105,14 +104,13 @@ getCiphersuites timeout certStore host = do
         if not (null ciphers)
             then catch
                 (do
-                    {-result <- T.timeout (timeout*1000000) $-}
+                    result <- T.timeout (timeout*1000000) $
                         withContext host weakRng certStore ciphers $ \context -> do
                             contextHookSetHandshakeRecv context handshakeRecvHook
                             handshake context
-                        loop ciphersRef cipherIdsRef)
-                    {-case result of-}
-                        {-Nothing -> return (host,[]) -- timed out-}
-                        {-Just _  -> loop ciphersRef cipherIdsRef)-}
+                    case result of
+                        Nothing -> return (host,[]) -- timed out
+                        Just _  -> loop ciphersRef cipherIdsRef)
                 (\(_ :: SomeException) -> makeReturnValue)
             else makeReturnValue
       where

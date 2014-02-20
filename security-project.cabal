@@ -36,7 +36,7 @@ executable ciphersuites
                , x509-store >=1.4.4 && <1.5
   -- hs-source-dirs:
   default-language:    Haskell2010
-  ghc-options: -Wall -threaded
+  ghc-options: -O2 -Wall -threaded
 
 --executable log-handshake
   --main-is: LogHandshake.hs
