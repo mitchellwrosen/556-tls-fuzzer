@@ -15,8 +15,8 @@ build-type:          Simple
 -- extra-source-files:
 cabal-version:       >=1.10
 
-executable ciphersuites
-  main-is: Ciphersuites.hs
+executable main
+  main-is: Main.hs
   other-modules: Tls
                , Utils
   build-depends: base >=4.6 && <4.7

@@ -2,6 +2,7 @@
 
 module Utils where
 
+import Control.Concurrent.ParallelIO.Local (withPool, parallel)
 import Control.Exception
 import Debug.Trace
 
@@ -18,3 +19,7 @@ forMn_ = go 0
 -- action to completion.
 catch' :: IO a -> IO a -> IO a
 catch' a b = a `catch` (\(_ :: SomeException) -> b)
+
+-- | Run the IO actions in parallel with the provided number of threads.
+parallelWithPoolOf :: Int -> [IO a] -> IO [a]
+parallelWithPoolOf n as = withPool n (\pool -> parallel pool as)
