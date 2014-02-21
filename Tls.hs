@@ -1,11 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Tls
-    ( allCiphersuites
-    , allCompressions
-    , weakRng
-    , withContext
-    ) where
+module Tls where
+    {-( allCiphersuites-}
+    {-, allCompressions-}
+    {-, weakRng-}
+    {-, withContext-}
+    {-) where-}
 
 import           Control.Exception          (bracket, bracketOnError)
 import           Crypto.Random              (CPRG, SystemRNG, cprgCreate, createTestEntropyPool)
@@ -37,7 +37,8 @@ allCiphersuites =
 
 allCompressions :: [Compression]
 allCompressions =
-    [ Compression Compression1
+    [ nullCompression
+    , Compression Compression1
     , Compression Compression2
     , Compression Compression3
     , Compression Compression4
@@ -331,7 +332,7 @@ makeContext host rng certStore ciphers compressions = do
             , clientWantSessionResume       = Nothing
             , clientShared                  = def { sharedCAStore = certStore }
             , clientHooks                   = def
-            , clientSupported               = def { supportedCiphers = ciphers 
+            , clientSupported               = def { supportedCiphers = ciphers
                                                   , supportedCompressions = compressions
                                                   }
             }

@@ -4,7 +4,10 @@ module Main where
 
 import           Control.Applicative
 import           Control.Exception
+import           Control.Monad
+import           Data.Default                        (def)
 import           Data.IORef
+import           Data.List                           (isInfixOf)
 import           Data.X509.CertificateStore          (CertificateStore)
 import           Network.Simple.TCP
 import           Network.TLS
@@ -19,7 +22,7 @@ import           Text.ParserCombinators.ReadP        (ReadP, (+++), string)
 import           Text.Read                           (readPrec)
 
 import Tls
-import Utils                                         (parallelWithPoolOf)
+import Utils
 
 data Metric
     = Ciphersuites
@@ -42,10 +45,11 @@ data Cli = Cli
     , cliFrom       :: Maybe Int
     , cliTo         :: Maybe Int
     , cliHostfile   :: FilePath
+    , cliDebug      :: Bool
     }
 
 cli :: Parser Cli
-cli = Cli <$> metric <*> numThreads <*> timeout <*> from <*> to <*> hostfile
+cli = Cli <$> metric <*> numThreads <*> timeout <*> from <*> to <*> hostfile <*> debug
   where
     metric :: Parser Metric
     metric = option $
@@ -87,6 +91,13 @@ cli = Cli <$> metric <*> numThreads <*> timeout <*> from <*> to <*> hostfile
         help "The file of hosts to connect to, one per line" <>
         metavar "HOSTS"
 
+    debug :: Parser Bool
+    debug = switch $
+        short 'd' <>
+        long "debug" <>
+        help "Turn this flag on to log packets sent/recieved to stderr" <>
+        metavar "DEBUG"
+
 main :: IO ()
 main = execParser opts >>= main2
   where
@@ -96,7 +107,7 @@ main = execParser opts >>= main2
         header "Ciphersuite scraper"
 
 main2 :: Cli -> IO ()
-main2 (Cli metric numThreads timeout mfrom mto hostfile) = do
+main2 (Cli metric numThreads timeout mfrom mto hostfile debug) = do
     hSetBuffering stderr NoBuffering
 
     let from = maybe 0 id mfrom
@@ -111,12 +122,12 @@ main2 (Cli metric numThreads timeout mfrom mto hostfile) = do
     main3 Compressions = main4 getCompressions
 
     main4 :: Show a
-          => (Int -> CertificateStore -> HostName -> IO (HostName,a))
+          => (Bool -> Int -> CertificateStore -> HostName -> IO (HostName,a))
           -> CertificateStore
           -> [HostName]
           -> IO ()
     main4 getMetric certStore hosts =
-        parallelWithPoolOf numThreads (map (getMetric timeout certStore) hosts) >>= putStrLn . formatOutput
+        parallelWithPoolOf numThreads (map (getMetric debug timeout certStore) hosts) >>= putStrLn . formatOutput
       where
         formatOutput :: Show a => [(HostName,a)] -> String
         formatOutput = unlines . map formatOutput'
@@ -124,8 +135,8 @@ main2 (Cli metric numThreads timeout mfrom mto hostfile) = do
             formatOutput' :: Show a => (HostName,a) -> String
             formatOutput' (host, cs) = host ++ " " ++ show cs
 
-getCiphersuites :: Int -> CertificateStore -> HostName -> IO (HostName,[CipherID])
-getCiphersuites timeout certStore host = do
+getCiphersuites :: Bool -> Int -> CertificateStore -> HostName -> IO (HostName,[CipherID])
+getCiphersuites debug timeout certStore host = do
     hPutStr stderr "."
     ciphersRef   <- newIORef allCiphersuites
     cipherIdsRef <- newIORef []
@@ -141,11 +152,14 @@ getCiphersuites timeout certStore host = do
                     result <- T.timeout (timeout*1000000) $
                         withContext host weakRng certStore ciphers [nullCompression] $ \context -> do
                             contextHookSetHandshakeRecv context handshakeRecvHook
+                            when debug $
+                                contextHookSetLogging context def { loggingPacketSent = hPutStrLn stderr . ("SENT: " ++)
+                                                                  , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++) }
                             handshake context
                     case result of
                         Nothing -> return (host,[]) -- timed out
                         Just _  -> loop ciphersRef cipherIdsRef)
-                (\(_ :: SomeException) -> makeReturnValue)
+                (\(_ :: SomeException) -> makeReturnValue) -- probably an alert, no ciphersuites accepted
             else makeReturnValue
       where
         makeReturnValue :: IO (HostName,[CipherID])
@@ -164,8 +178,8 @@ getCiphersuites timeout certStore host = do
                 | otherwise = x : deleteSelectedCipher xs
         handshakeRecvHook hs = return hs
 
-getCompressions :: Int -> CertificateStore -> HostName -> IO (HostName,[CompressionID])
-getCompressions timeout certStore host = do
+getCompressions :: Bool -> Int -> CertificateStore -> HostName -> IO (HostName,[CompressionID])
+getCompressions debug timeout certStore host = do
     hPutStr stderr "."
     compressionsRef   <- newIORef allCompressions
     compressionIdsRef <- newIORef []
@@ -178,15 +192,33 @@ getCompressions timeout certStore host = do
             then catch
                 (do
                     result <- T.timeout (timeout*1000000) $
-                        withContext host weakRng certStore allCiphersuites compressions $ \context -> do
-                            contextHookSetHandshakeRecv context handshakeRecvHook
-                            handshake context
+                        withContext host
+                                    weakRng
+                                    certStore
+                                    allCiphersuites
+                                    (take 127 compressions) -- compression_methods<1..2^8-1> means at most 255 bytes
+                            $ \context -> do
+                                contextHookSetHandshakeRecv context handshakeRecvHook
+                                when debug $
+                                    contextHookSetLogging context def { loggingPacketSent = hPutStrLn stderr . ("SENT: " ++)
+                                                                      , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++) }
+                                handshake context
                     case result of
                         Nothing -> return (host,[]) -- timed out
                         Just _  -> loop compressionsRef compressionIdsRef)
-                (\(_ :: SomeException) -> makeReturnValue)
+                onError
             else makeReturnValue
       where
+        onError :: SomeException -> IO (HostName,[CompressionID])
+        onError e = case fromException e of
+            Just (HandshakeFailed (Error_Packet_unexpected s _)) ->
+                if "DecompressionFailure" `isInfixOf` s
+                    then loop compressionsRef compressionIdsRef
+                    else hPutStr stderr (show e) >> makeReturnValue
+            -- hopefully this is a DecodeError, which we expect when the server didn't accept any compression methods
+            Just _ -> makeReturnValue
+            Nothing -> makeReturnValue
+
         makeReturnValue :: IO (HostName,[CompressionID])
         makeReturnValue = (host,) <$> readIORef compressionIdsRef
 
