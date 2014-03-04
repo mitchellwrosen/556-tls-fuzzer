@@ -295,6 +295,9 @@ allCompressions =
     , Compression Compression255
     ]
 
+allVersions :: [Version]
+allVersions = [SSL3, TLS10, TLS11, TLS12]
+
 weakRng :: SystemRNG
 weakRng = cprgCreate (createTestEntropyPool "foobar")
 
@@ -302,13 +305,12 @@ withContext :: CPRG a
             => HostName
             -> a
             -> CertificateStore
-            -> [Cipher]
-            -> [Compression]
+            -> Supported
             -> (Context -> IO b)
             -> IO b
-withContext host rng certStore ciphers compressions =
+withContext host rng certStore supported =
     bracket
-        (makeContext host rng certStore ciphers compressions)
+        (makeContext host rng certStore supported)
         contextClose
 
 -- | Like Network.Simple.TCP.connect, but keep the socket alive after the
@@ -320,10 +322,9 @@ makeContext :: CPRG a
             => HostName
             -> a
             -> CertificateStore
-            -> [Cipher]
-            -> [Compression]
+            -> Supported
             -> IO Context
-makeContext host rng certStore ciphers compressions = do
+makeContext host rng certStore supported =
     withPersistentTcp host "443" $ \(sock, _) -> do
         let params = ClientParams {
               clientUseMaxFragmentLength    = Nothing
@@ -332,9 +333,7 @@ makeContext host rng certStore ciphers compressions = do
             , clientWantSessionResume       = Nothing
             , clientShared                  = def { sharedCAStore = certStore }
             , clientHooks                   = def
-            , clientSupported               = def { supportedCiphers = ciphers
-                                                  , supportedCompressions = compressions
-                                                  }
+            , clientSupported               = supported
             }
 
         contextNew sock params rng

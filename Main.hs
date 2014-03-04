@@ -7,7 +7,7 @@ import           Control.Exception
 import           Control.Monad
 import           Data.Default                        (def)
 import           Data.IORef
-import           Data.List                           (isInfixOf)
+import           Data.List                           (delete, isInfixOf, nub)
 import           Data.X509.CertificateStore          (CertificateStore)
 import           Network.Simple.TCP
 import           Network.TLS
@@ -27,16 +27,16 @@ import Utils
 data Metric
     = Ciphersuites
     | Compressions
+    | Versions
     deriving Show
 
 instance Read Metric where
-    readPrec = lift (ciphersuites +++ compressions)
+    readPrec = lift (ciphersuites +++ compressions +++ versions)
       where
-        ciphersuites :: ReadP Metric
+        ciphersuites, compressions, versions :: ReadP Metric
         ciphersuites = Ciphersuites <$ string "ciphersuites"
-
-        compressions :: ReadP Metric
         compressions = Compressions <$ string "compressions"
+        versions     = Versions     <$ string "versions"
 
 data Cli = Cli
     { cliMetric     :: Metric
@@ -55,56 +55,56 @@ cli = Cli <$> metric <*> numThreads <*> timeout <*> from <*> to <*> hostfile <*>
     metric = option $
         short 'm' <>
         long "metric" <>
-        help "The metric to gather (\"ciphersuites\" or \"compressions\")" <>
-        metavar "METRIC"
+        help "\"ciphersuites\", \"compressions\", or \"versions\"" <>
+        metavar "<string>"
 
     numThreads :: Parser Int
     numThreads = option $
         short 'n' <>
         long "num-threads" <>
-        help "The maximum number of threads to use." <>
+        help "Thread pool size" <>
         value 10 <>
-        metavar "NUM-THREADS"
+        metavar "<int>"
 
     timeout :: Parser Int
     timeout = option $
         short 't' <>
         long "timeout" <>
-        help "The timeout (in seconds) before closing a connection." <>
+        help "The timeout (in seconds) before closing a connection" <>
         value 5 <>
-        metavar "TIMEOUT"
+        metavar "<int>"
 
     from :: Parser (Maybe Int)
     from = optional $ option $
         long "from" <>
-        help "From host" <>
-        metavar "FROM"
+        help "From host index" <>
+        metavar "<int>"
 
     to :: Parser (Maybe Int)
     to = optional $ option $
         long "to" <>
-        help "To host" <>
-        metavar "TO"
+        help "To host index" <>
+        metavar "<int>"
 
     hostfile :: Parser String
     hostfile = argument str $
         help "The file of hosts to connect to, one per line" <>
-        metavar "HOSTS"
+        metavar "<filename>"
 
     debug :: Parser Bool
     debug = switch $
         short 'd' <>
         long "debug" <>
-        help "Turn this flag on to log packets sent/recieved to stderr" <>
-        metavar "DEBUG"
+        help "Turn this flag on to log packets sent/recieved to stderr"
 
 main :: IO ()
 main = execParser opts >>= main2
   where
     opts = info (helper <*> cli) $
         fullDesc <>
-        progDesc "Determine the ciphersuites accepted by HTTPS servers." <>
-        header "Ciphersuite scraper"
+        header (unlines [ "TLS Supported Capabilities Tool Thing Pro"
+                        , "This is not free software! PLEASE PURCHASE"
+                        ])
 
 main2 :: Cli -> IO ()
 main2 (Cli metric numThreads timeout mfrom mto hostfile debug) = do
@@ -120,6 +120,7 @@ main2 (Cli metric numThreads timeout mfrom mto hostfile debug) = do
     main3 :: Metric -> CertificateStore -> [HostName] -> IO ()
     main3 Ciphersuites = main4 getCiphersuites
     main3 Compressions = main4 getCompressions
+    main3 Versions     = main4 getVersions
 
     main4 :: Show a
           => (Bool -> Int -> CertificateStore -> HostName -> IO (HostName,a))
@@ -149,12 +150,18 @@ getCiphersuites debug timeout certStore host = do
         if not (null ciphers)
             then catch
                 (do
+                    let supported = def { supportedCiphers = ciphers }
+
                     result <- T.timeout (timeout*1000000) $
-                        withContext host weakRng certStore ciphers [nullCompression] $ \context -> do
+                        withContext host
+                                    weakRng
+                                    certStore
+                                    supported $ \context -> do
                             contextHookSetHandshakeRecv context handshakeRecvHook
                             when debug $
                                 contextHookSetLogging context def { loggingPacketSent = hPutStrLn stderr . ("SENT: " ++)
-                                                                  , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++) }
+                                                                  , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++)
+                                                                  }
                             handshake context
                     case result of
                         Nothing -> return (host,[]) -- timed out
@@ -191,12 +198,16 @@ getCompressions debug timeout certStore host = do
         if not (null compressions)
             then catch
                 (do
+                    -- compression_methods<1..2^8-1> means at most 255 bytes
+                    let supported = def { supportedCompressions = take 127 compressions
+                                        , supportedCiphers = allCiphersuites
+                                        }
+
                     result <- T.timeout (timeout*1000000) $
                         withContext host
                                     weakRng
                                     certStore
-                                    allCiphersuites
-                                    (take 127 compressions) -- compression_methods<1..2^8-1> means at most 255 bytes
+                                    supported
                             $ \context -> do
                                 contextHookSetHandshakeRecv context handshakeRecvHook
                                 when debug $
@@ -211,6 +222,8 @@ getCompressions debug timeout certStore host = do
       where
         onError :: SomeException -> IO (HostName,[CompressionID])
         onError e = case fromException e of
+            -- A HandshakeFailed is expected because the (de)compression is not actually implemented, only the
+            -- value is sent.
             Just (HandshakeFailed (Error_Packet_unexpected s _)) ->
                 if "DecompressionFailure" `isInfixOf` s
                     then loop compressionsRef compressionIdsRef
@@ -233,4 +246,52 @@ getCompressions debug timeout certStore host = do
             deleteSelectedCompression ((Compression x):xs)
                 | compressionCID x == cid = xs
                 | otherwise = Compression x : deleteSelectedCompression xs
+        handshakeRecvHook hs = return hs
+
+
+getVersions :: Bool -> Int -> CertificateStore -> HostName -> IO (HostName,[Version])
+getVersions debug timeout certStore host = do
+    hPutStr stderr "."
+    versionsToTryRef    <- newIORef allVersions
+    versionsAcceptedRef <- newIORef []
+    loop versionsToTryRef versionsAcceptedRef
+  where
+    loop :: IORef [Version] -> IORef [Version] -> IO (HostName,[Version])
+    loop versionsToTryRef versionsAcceptedRef = do
+        versionsToTry <- readIORef versionsToTryRef
+        if not (null versionsToTry)
+            then catch
+                (do
+                    let supported = def { supportedVersions = versionsToTry
+                                        , supportedCiphers = allCiphersuites
+                                        }
+
+                    result <- T.timeout (timeout*1000000) $
+                        withContext host
+                                    weakRng
+                                    certStore
+                                    supported
+                            $ \context -> do
+                                contextHookSetHandshakeRecv context handshakeRecvHook
+                                when debug $
+                                    contextHookSetLogging context def { loggingPacketSent = hPutStrLn stderr . ("SENT: " ++)
+                                                                      , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++)
+                                                                      }
+                                handshake context
+                    case result of
+                        Nothing -> return (host,[])  -- timed out
+                        Just _  -> loop versionsToTryRef versionsAcceptedRef)
+                (\(_ :: SomeException) -> makeReturnValue) -- probably an alert, no version accepted
+            else makeReturnValue
+      where
+        -- nub, because a ChangeCipherSpec message is required when a server responds with a different
+        -- version than the one requested, resulting in possibly logging the same version recieved
+        makeReturnValue :: IO (HostName,[Version])
+        makeReturnValue = (host,) . nub <$> readIORef versionsAcceptedRef
+
+        handshakeRecvHook :: Handshake -> IO Handshake
+        handshakeRecvHook hs@(ServerHello ver _ _ _ _ _) = do
+            modifyIORef' versionsToTryRef (delete ver)
+            modifyIORef' versionsAcceptedRef (++ [ver])
+            return hs
         handshakeRecvHook hs = return hs
