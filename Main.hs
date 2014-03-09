@@ -11,6 +11,7 @@ import           Data.List                           (delete, isInfixOf, nub)
 import           Data.X509.CertificateStore          (CertificateStore)
 import           Network.Simple.TCP
 import           Network.TLS
+import           Network.TLS.IO                      (sendPacket)
 import           Network.TLS.Struct
 import           Network.TLS.Types
 import           Options.Applicative
@@ -28,15 +29,17 @@ data Metric
     = Ciphersuites
     | Compressions
     | Versions
+    | Fuzzer
     deriving Show
 
 instance Read Metric where
-    readPrec = lift (ciphersuites +++ compressions +++ versions)
+    readPrec = lift (ciphersuites +++ compressions +++ versions +++ fuzzer)
       where
         ciphersuites, compressions, versions :: ReadP Metric
         ciphersuites = Ciphersuites <$ string "ciphersuites"
         compressions = Compressions <$ string "compressions"
         versions     = Versions     <$ string "versions"
+        fuzzer       = Fuzzer       <$ string "fuzzer"
 
 data Cli = Cli
     { cliMetric     :: Metric
@@ -55,7 +58,7 @@ cli = Cli <$> metric <*> numThreads <*> timeout <*> from <*> to <*> hostfile <*>
     metric = option $
         short 'm' <>
         long "metric" <>
-        help "\"ciphersuites\", \"compressions\", or \"versions\"" <>
+        help "\"ciphersuites\", \"compressions\", \"versions\", or \"fuzzer\"" <>
         metavar "<string>"
 
     numThreads :: Parser Int
@@ -121,15 +124,21 @@ main2 (Cli metric numThreads timeout mfrom mto hostfile debug) = do
     main3 Ciphersuites = main4 getCiphersuites
     main3 Compressions = main4 getCompressions
     main3 Versions     = main4 getVersions
+    main3 Fuzzer       = main4 fuzz1
 
-    main4 :: Show a
+    main4 :: forall a. Show a
           => (Bool -> Int -> CertificateStore -> HostName -> IO (HostName,a))
           -> CertificateStore
           -> [HostName]
           -> IO ()
     main4 getMetric certStore hosts =
-        parallelWithPoolOf numThreads (map (getMetric debug timeout certStore) hosts) >>= putStrLn . formatOutput
+        parallelWithPoolOf numThreads (map work hosts) >>= putStrLn . formatOutput
       where
+        work :: HostName -> IO (HostName, a)
+        work host = do
+            hPutStr stderr "."
+            getMetric debug timeout certStore host
+
         formatOutput :: Show a => [(HostName,a)] -> String
         formatOutput = unlines . map formatOutput'
           where
@@ -138,7 +147,6 @@ main2 (Cli metric numThreads timeout mfrom mto hostfile debug) = do
 
 getCiphersuites :: Bool -> Int -> CertificateStore -> HostName -> IO (HostName,[CipherID])
 getCiphersuites debug timeout certStore host = do
-    hPutStr stderr "."
     ciphersRef   <- newIORef allCiphersuites
     cipherIdsRef <- newIORef []
     loop ciphersRef cipherIdsRef
@@ -159,9 +167,7 @@ getCiphersuites debug timeout certStore host = do
                                     supported $ \context -> do
                             contextHookSetHandshakeRecv context handshakeRecvHook
                             when debug $
-                                contextHookSetLogging context def { loggingPacketSent = hPutStrLn stderr . ("SENT: " ++)
-                                                                  , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++)
-                                                                  }
+                                contextHookSetLogging context logging
                             handshake context
                     case result of
                         Nothing -> return (host,[]) -- timed out
@@ -187,7 +193,6 @@ getCiphersuites debug timeout certStore host = do
 
 getCompressions :: Bool -> Int -> CertificateStore -> HostName -> IO (HostName,[CompressionID])
 getCompressions debug timeout certStore host = do
-    hPutStr stderr "."
     compressionsRef   <- newIORef allCompressions
     compressionIdsRef <- newIORef []
     loop compressionsRef compressionIdsRef
@@ -211,8 +216,7 @@ getCompressions debug timeout certStore host = do
                             $ \context -> do
                                 contextHookSetHandshakeRecv context handshakeRecvHook
                                 when debug $
-                                    contextHookSetLogging context def { loggingPacketSent = hPutStrLn stderr . ("SENT: " ++)
-                                                                      , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++) }
+                                    contextHookSetLogging context logging
                                 handshake context
                     case result of
                         Nothing -> return (host,[]) -- timed out
@@ -251,7 +255,6 @@ getCompressions debug timeout certStore host = do
 
 getVersions :: Bool -> Int -> CertificateStore -> HostName -> IO (HostName,[Version])
 getVersions debug timeout certStore host = do
-    hPutStr stderr "."
     versionsToTryRef    <- newIORef allVersions
     versionsAcceptedRef <- newIORef []
     loop versionsToTryRef versionsAcceptedRef
@@ -295,3 +298,42 @@ getVersions debug timeout certStore host = do
             modifyIORef' versionsAcceptedRef (++ [ver])
             return hs
         handshakeRecvHook hs = return hs
+
+data ServerResponse
+    = Correct
+    | Incorrect
+    | Ex TLSException
+    | None
+    deriving Show
+
+fuzz1 :: Bool -> Int -> CertificateStore -> HostName -> IO (HostName, ServerResponse)
+fuzz1 debug timeout certStore host = catch fuzz1' onError
+  where
+    onError :: SomeException -> IO (HostName, ServerResponse)
+    onError e = case fromException e :: Maybe TLSException of
+        -- We only expect a TLSException...
+        Nothing -> return (host, None)
+        -- In fact, only a specific TLSException
+        Just (Terminated _ _ (Error_Protocol (_, _, UnexpectedMessage))) -> return (host, Correct)
+        Just err -> return (host, Ex err)
+
+    fuzz1' :: IO (HostName, ServerResponse)
+    fuzz1' = do
+        let supported = def { supportedCiphers = allCiphersuites }
+
+        gotResponse <- T.timeout (timeout*1000000) $
+            withContext host weakRng certStore supported $ \context -> do
+                when debug $
+                    contextHookSetLogging context logging
+                handshake context
+                sendPacket context Dummy
+                void $ T.timeout (timeout*1000000) $ recvData context -- expect TLSException thrown here
+        case gotResponse of
+            Nothing -> return (host, None) -- timed out, no response
+            Just _ -> return (host, Incorrect) -- any response that doesn't throw a TLSException is incorrect
+
+logging :: Logging
+logging = def
+    { loggingPacketSent = hPutStrLn stderr . ("SENT: " ++)
+    , loggingPacketRecv = hPutStrLn stderr . ("RECV: " ++)
+    }
